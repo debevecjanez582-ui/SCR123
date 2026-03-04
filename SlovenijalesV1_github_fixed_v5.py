@@ -183,49 +183,54 @@ def human_sleep(min_s: float = None, max_s: float = None) -> None:
 # BLOCK DETECTOR (FIXED)
 # ==========================
 def is_block_page(html: str) -> bool:
-    """Ne označi kot BLOCK samo zato, ker se v HTML pojavi 'recaptcha' ali 'captcha'."""
+    """Best-effort detekcija *prave* challenge/captcha strani.
+
+    Namen: zmanjšati false-positive.
+    - NE flaggamo strani samo zato, ker vsebujejo 'captcha' ali 'recaptcha' skripte.
+    - Flag je samo pri zelo značilnih podpisih (Cloudflare/PerimeterX/DataDome/Incapsula...).
+
+    Če je trgovina res prešla na obvezno JS-verifikacijo, bo ta funkcija še vedno ujela te strani.
+    """
     if not html:
         return False
 
     t = html.lower()
 
-    strong = [
-        "/cdn-cgi/challenge-platform",
-        "cf-chl-",
-        "cloudflare ray id",
-        "attention required",
-        "access denied",
-        "request blocked",
-        "your request has been blocked",
-        "verifying you are human",
-        "verify you are human",
-        "please enable cookies",
-        "enable javascript and cookies",
-        "perimeterx",
-        "px-captcha",
-        "px-block",
-        "datadome",
-        "incapsula",
-        "sucuri website firewall",
-        "ddos-guard",
-        "akamai bot manager",
-        "one moment, please",
-    ]
-    if any(n in t for n in strong):
+    # Cloudflare
+    if (
+        '/cdn-cgi/challenge-platform' in t
+        or 'cf-chl-' in t
+        or '__cf_chl' in t
+        or 'cloudflare ray id' in t
+    ):
         return True
 
-    # Če je recaptcha/turnstile ipd, samo če je tudi "challenge" kontekst
-    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
-        if any(x in t for x in ("verify", "verifying", "blocked", "access denied", "challenge", "one moment")):
+    # PerimeterX
+    if ('perimeterx' in t) or ('px-captcha' in t) or ('px-block' in t) or ('_pxappid' in t):
+        return True
+
+    # DataDome (običajno vsebuje besedo datadome + captcha/blocked/verify)
+    if 'datadome' in t and any(x in t for x in ('captcha', 'blocked', 'verify', 'verifying')):
+        return True
+
+    # Incapsula
+    if 'incapsula' in t and any(x in t for x in ('request unsuccessful', 'visid_incap', 'incap_ses')):
+        return True
+
+    # Akamai (tipično jasno napiše)
+    if 'akamai bot manager' in t:
+        return True
+
+    # Genericne WAF challenge strani
+    if any(x in t for x in ('verifying you are human', 'verify you are human', 'one moment, please', 'attention required')):
+        return True
+
+    # Če je captcha widget + challenge kontekst
+    if re.search(r"(hcaptcha|cf-turnstile|g-recaptcha|data-sitekey)", t):
+        if any(x in t for x in ('verify', 'verifying', 'challenge', 'access denied', 'blocked')):
             return True
 
-    # soft: več signalov skupaj
-    soft = 0
-    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
-        if n in t:
-            soft += 1
-    return soft >= 4
-
+    return False
 
 def create_output_paths(shop_name: str):
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -741,112 +746,18 @@ def main():
 
     session = build_session()
 
+
+
+    # Warm-up: pridobi osnovne piškotke (cookie consent / session)
+
+    try:
+
+        session.get(BASE_URL, headers={'User-Agent': (_RUN_UA if '_RUN_UA' in globals() else HEADERS.get('User-Agent', 'Mozilla/5.0'))}, timeout=20)
+
+    except Exception:
+
+        pass
     # Preflight
     test_url = f"{list(SLOVENIJALES_CATEGORIES.values())[0][0]}?page=1"
     test_html = get_page_content(session, test_url, referer=BASE_URL)
-    if not test_html:
-        log_and_print("Slovenijales vrača verification/challenge že na prvi list strani. Ne nadaljujem.")
-        store_order = SLOV_STORE_FALLBACK
-        store_cols = [f"Zaloga - {s}" for s in store_order]
-        write_empty_outputs(json_path, excel_path, store_cols)
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-        return
-
-    store_order = fetch_store_order(session)
-    store_cols = [f"Zaloga - {s}" for s in store_order]
-    log_and_print(f"Poslovalnice ({len(store_order)}): {', '.join(store_order[:6])}{' ...' if len(store_order) > 6 else ''}")
-
-    existing_urls = set()
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if isinstance(d, list) and d:
-                for x in d:
-                    if isinstance(x, dict) and x.get("URL"):
-                        existing_urls.add(x["URL"])
-                _global_item_counter = max((int(x.get("Zap", 0)) for x in d if isinstance(x, dict)), default=0)
-        except Exception:
-            pass
-
-    date_str = datetime.now().strftime("%d/%m/%Y")
-    buffer: List[Dict[str, Any]] = []
-    processed_in_run = 0
-
-    try:
-        for cat, urls in SLOVENIJALES_CATEGORIES.items():
-            log_and_print(f"\n=== {cat} ===")
-
-            for category_url in urls:
-                sub_name = category_url.strip("/").split("/")[-1]
-                group_name = sub_name if sub_name else cat
-                log_and_print(f"\n-- Podkategorija: {group_name}")
-
-                product_urls = get_product_links_from_category(session, category_url)
-
-                for product_url in product_urls:
-                    if product_url in existing_urls:
-                        continue
-
-                    log_and_print(f"    Izdelek: {product_url}")
-                    human_sleep()
-
-                    details = extract_product_details(
-                        session=session,
-                        product_url=product_url,
-                        category_name=cat,
-                        date_str=date_str,
-                        referer=category_url,
-                        store_order=store_order,
-                    )
-                    if details:
-                        buffer.append(details)
-                        existing_urls.add(product_url)
-                        processed_in_run += 1
-
-                    if len(buffer) >= BUFFER_FLUSH:
-                        save_data_append(buffer, json_path)
-                        buffer = []
-
-                    if processed_in_run > 0 and (processed_in_run % BREAK_EVERY_PRODUCTS == 0):
-                        bmin, bmax = BREAK_SLEEP_RANGE
-                        wait = random.uniform(bmin, bmax)
-                        log_and_print(f"PAUSE: {processed_in_run} izdelkov -> počitek {wait:.1f}s")
-                        time.sleep(wait)
-
-                    human_sleep(0.8, 2.2)
-
-                if buffer:
-                    save_data_append(buffer, json_path)
-                    buffer = []
-
-                human_sleep(2.0, 6.0)
-
-    except Exception as e:
-        log_and_print(f"NAPAKA: {e}")
-    finally:
-        try:
-            if buffer:
-                save_data_append(buffer, json_path)
-        except Exception:
-            pass
-
-        if EXPORT_EXCEL:
-            try:
-                write_excel_from_json(json_path, excel_path, store_cols)
-            except Exception as e:
-                log_and_print(f"NAPAKA pri Excel: {e}")
-
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    main()
+    
