@@ -235,20 +235,56 @@ def get_headers(referer: Optional[str] = None) -> Dict[str, str]:
 
 
 def is_block_page(html: str) -> bool:
-    """Detekcija bot-protection/captcha strani."""
+    """Bolj varna detekcija block/challenge strani.
+
+    Prejšnja verzija je iskala substring "captcha", kar je povzročilo lažne alarme
+    (npr. "reCAPTCHA" scripti na normalnih straneh). Ta verzija išče bolj specifične
+    indikatorje (Cloudflare/PerimeterX/DataDome/Incapsula ipd.).
+    """
     if not html:
         return False
-    t = html.lower()
-    needles = [
-        "captcha",
-        "verifying you are human",
-        "request is being verified",
-        "access denied",
-        "cloudflare",
-        "one moment, please",
-    ]
-    return any(n in t for n in needles)
 
+    t = html.lower()
+
+    # zelo močni indikatorji zaščite (challenge stran)
+    strong_needles = [
+        "/cdn-cgi/challenge-platform",   # Cloudflare
+        "cf-chl-",                        # Cloudflare challenge
+        "cloudflare ray id",
+        "attention required",
+        "access denied",
+        "request blocked",
+        "your request has been blocked",
+        "verifying you are human",
+        "verify you are human",
+        "please enable cookies",
+        "enable javascript and cookies",
+        "perimeterx",
+        "px-captcha",
+        "px-block",
+        "datadome",
+        "geo.captcha",
+        "incapsula",
+        "sucuri website firewall",
+        "ddos-guard",
+        "akamai bot manager",
+    ]
+    if any(n in t for n in strong_needles):
+        return True
+
+    # captcha widget indikatorji (specifični – ne "captcha" na splošno!)
+    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
+        # g-recaptcha sam po sebi lahko obstaja tudi na normalnih straneh,
+        # zato preverimo še, da je prisotna tudi kakšna "challenge" fraza
+        if ("verify" in t) or ("verifying" in t) or ("access denied" in t) or ("blocked" in t):
+            return True
+
+    # "soft" indikatorji – če se pojavijo skupaj
+    soft = 0
+    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
+        if n in t:
+            soft += 1
+    return soft >= 4
 
 def get_page_content(session: requests.Session, url: str, referer: Optional[str] = None) -> Optional[str]:
     """
