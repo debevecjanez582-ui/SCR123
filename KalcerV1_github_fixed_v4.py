@@ -238,50 +238,55 @@ def create_output_paths(shop_name: str):
 # Block detector (NO false-positive on "reCAPTCHA")
 # -----------------------------
 def is_block_page(html: str) -> bool:
+    """Best-effort detekcija *prave* challenge/captcha strani.
+
+    Namen: zmanjšati false-positive.
+    - NE flaggamo strani samo zato, ker vsebujejo 'captcha' ali 'recaptcha' skripte.
+    - Flag je samo pri zelo značilnih podpisih (Cloudflare/PerimeterX/DataDome/Incapsula...).
+
+    Če je trgovina res prešla na obvezno JS-verifikacijo, bo ta funkcija še vedno ujela te strani.
+    """
     if not html:
         return False
+
     t = html.lower()
 
-    strong_needles = [
-        "/cdn-cgi/challenge-platform",  # Cloudflare
-        "cf-chl-",
-        "cloudflare ray id",
-        "attention required",
-        "access denied",
-        "request blocked",
-        "your request has been blocked",
-        "verifying you are human",
-        "verify you are human",
-        "please enable cookies",
-        "enable javascript and cookies",
-        "perimeterx",
-        "px-captcha",
-        "px-block",
-        "datadome",
-        "incapsula",
-        "sucuri website firewall",
-        "ddos-guard",
-        "akamai bot manager",
-    ]
-    if any(n in t for n in strong_needles):
+    # Cloudflare
+    if (
+        '/cdn-cgi/challenge-platform' in t
+        or 'cf-chl-' in t
+        or '__cf_chl' in t
+        or 'cloudflare ray id' in t
+    ):
         return True
 
-    # captcha widget indikatorji: samo, če je zraven še “challenge” kontekst
-    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
-        if any(x in t for x in ("verify", "verifying", "blocked", "access denied", "challenge")):
+    # PerimeterX
+    if ('perimeterx' in t) or ('px-captcha' in t) or ('px-block' in t) or ('_pxappid' in t):
+        return True
+
+    # DataDome (običajno vsebuje besedo datadome + captcha/blocked/verify)
+    if 'datadome' in t and any(x in t for x in ('captcha', 'blocked', 'verify', 'verifying')):
+        return True
+
+    # Incapsula
+    if 'incapsula' in t and any(x in t for x in ('request unsuccessful', 'visid_incap', 'incap_ses')):
+        return True
+
+    # Akamai (tipično jasno napiše)
+    if 'akamai bot manager' in t:
+        return True
+
+    # Genericne WAF challenge strani
+    if any(x in t for x in ('verifying you are human', 'verify you are human', 'one moment, please', 'attention required')):
+        return True
+
+    # Če je captcha widget + challenge kontekst
+    if re.search(r"(hcaptcha|cf-turnstile|g-recaptcha|data-sitekey)", t):
+        if any(x in t for x in ('verify', 'verifying', 'challenge', 'access denied', 'blocked')):
             return True
 
-    # soft heuristika: več signalov skupaj
-    soft = 0
-    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
-        if n in t:
-            soft += 1
-    return soft >= 4
+    return False
 
-
-# -----------------------------
-# Networking (retry/backoff)
-# -----------------------------
 def build_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
@@ -958,6 +963,17 @@ def main():
 
     session = build_session()
 
+
+
+    # Warm-up: pridobi osnovne piškotke (cookie consent / session)
+
+    try:
+
+        session.get(BASE_URL, headers={'User-Agent': (_RUN_UA if '_RUN_UA' in globals() else HEADERS.get('User-Agent', 'Mozilla/5.0'))}, timeout=20)
+
+    except Exception:
+
+        pass
     # nadaljuj Zap, če json že obstaja
     if os.path.exists(json_path):
         try:
