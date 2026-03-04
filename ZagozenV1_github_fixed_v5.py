@@ -154,62 +154,56 @@ def human_sleep(min_s: float = None, max_s: float = None) -> None:
 
 
 def is_block_page(html: str) -> bool:
+    """Bolj varna detekcija block/challenge strani.
+
+    Prejšnja verzija je iskala substring "captcha", kar je povzročilo lažne alarme
+    (npr. "reCAPTCHA" scripti na normalnih straneh). Ta verzija išče bolj specifične
+    indikatorje (Cloudflare/PerimeterX/DataDome/Incapsula ipd.).
+    """
     if not html:
         return False
+
     t = html.lower()
-    needles = [
-        "captcha",
-        "verifying you are human",
-        "request is being verified",
+
+    # zelo močni indikatorji zaščite (challenge stran)
+    strong_needles = [
+        "/cdn-cgi/challenge-platform",   # Cloudflare
+        "cf-chl-",                        # Cloudflare challenge
+        "cloudflare ray id",
+        "attention required",
         "access denied",
-        "cloudflare",
-        "one moment, please",
+        "request blocked",
+        "your request has been blocked",
+        "verifying you are human",
+        "verify you are human",
+        "please enable cookies",
+        "enable javascript and cookies",
+        "perimeterx",
+        "px-captcha",
+        "px-block",
+        "datadome",
+        "geo.captcha",
+        "incapsula",
+        "sucuri website firewall",
+        "ddos-guard",
+        "akamai bot manager",
     ]
-    return any(n in t for n in needles)
+    if any(n in t for n in strong_needles):
+        return True
 
+    # captcha widget indikatorji (specifični – ne "captcha" na splošno!)
+    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
+        # g-recaptcha sam po sebi lahko obstaja tudi na normalnih straneh,
+        # zato preverimo še, da je prisotna tudi kakšna "challenge" fraza
+        if ("verify" in t) or ("verifying" in t) or ("access denied" in t) or ("blocked" in t):
+            return True
 
-# -----------------------------
-# Output paths
-# -----------------------------
-def create_output_paths(shop_name: str):
-    """OUTPUT_DIR/Ceniki_Scraping/<SHOP>/<YYYY-MM-DD>/..."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_root = os.environ.get("OUTPUT_DIR", script_dir)
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    daily_dir = os.path.join(output_root, "Ceniki_Scraping", shop_name, today)
-    os.makedirs(daily_dir, exist_ok=True)
-
-    filename_date = datetime.now().strftime("%d_%m_%Y")
-    json_path = os.path.join(daily_dir, f"{shop_name}_Podatki_{filename_date}.json")
-    excel_path = os.path.join(daily_dir, f"{shop_name}_Podatki_{filename_date}.xlsx")
-    log_path = os.path.join(daily_dir, f"{shop_name}_Scraping_Log_{datetime.now().strftime('%H-%M-%S')}.txt")
-
-    print(f"JSON pot: {json_path}")
-    print(f"Excel pot: {excel_path}")
-    print(f"Log pot: {log_path}")
-    return json_path, excel_path, log_path
-
-
-# -----------------------------
-# Networking
-# -----------------------------
-def build_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
+    # "soft" indikatorji – če se pojavijo skupaj
+    soft = 0
+    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
+        if n in t:
+            soft += 1
+    return soft >= 4
 
 def get_page_content(session: requests.Session, url: str, referer: Optional[str] = None) -> Optional[str]:
     headers = dict(HEADERS)
