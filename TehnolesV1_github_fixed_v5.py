@@ -188,46 +188,54 @@ def write_empty_outputs(json_path: str, excel_path: str) -> None:
 
 
 def is_block_page(html: str) -> bool:
-    """Detekcija challenge strani (brez false-positive na navadnih straneh)."""
+    """Best-effort detekcija *prave* challenge/captcha strani.
+
+    Namen: zmanjšati false-positive.
+    - NE flaggamo strani samo zato, ker vsebujejo 'captcha' ali 'recaptcha' skripte.
+    - Flag je samo pri zelo značilnih podpisih (Cloudflare/PerimeterX/DataDome/Incapsula...).
+
+    Če je trgovina res prešla na obvezno JS-verifikacijo, bo ta funkcija še vedno ujela te strani.
+    """
     if not html:
         return False
+
     t = html.lower()
 
-    strong_needles = [
-        "/cdn-cgi/challenge-platform",
-        "cf-chl-",
-        "cloudflare ray id",
-        "attention required",
-        "access denied",
-        "request blocked",
-        "your request has been blocked",
-        "verifying you are human",
-        "verify you are human",
-        "please enable cookies",
-        "enable javascript and cookies",
-        "perimeterx",
-        "px-captcha",
-        "px-block",
-        "datadome",
-        "incapsula",
-        "sucuri website firewall",
-        "ddos-guard",
-        "akamai bot manager",
-        "one moment, please",
-    ]
-    if any(n in t for n in strong_needles):
+    # Cloudflare
+    if (
+        '/cdn-cgi/challenge-platform' in t
+        or 'cf-chl-' in t
+        or '__cf_chl' in t
+        or 'cloudflare ray id' in t
+    ):
         return True
 
-    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
-        if any(x in t for x in ("verify", "verifying", "blocked", "access denied", "challenge", "one moment")):
+    # PerimeterX
+    if ('perimeterx' in t) or ('px-captcha' in t) or ('px-block' in t) or ('_pxappid' in t):
+        return True
+
+    # DataDome (običajno vsebuje besedo datadome + captcha/blocked/verify)
+    if 'datadome' in t and any(x in t for x in ('captcha', 'blocked', 'verify', 'verifying')):
+        return True
+
+    # Incapsula
+    if 'incapsula' in t and any(x in t for x in ('request unsuccessful', 'visid_incap', 'incap_ses')):
+        return True
+
+    # Akamai (tipično jasno napiše)
+    if 'akamai bot manager' in t:
+        return True
+
+    # Genericne WAF challenge strani
+    if any(x in t for x in ('verifying you are human', 'verify you are human', 'one moment, please', 'attention required')):
+        return True
+
+    # Če je captcha widget + challenge kontekst
+    if re.search(r"(hcaptcha|cf-turnstile|g-recaptcha|data-sitekey)", t):
+        if any(x in t for x in ('verify', 'verifying', 'challenge', 'access denied', 'blocked')):
             return True
 
-    soft = 0
-    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
-        if n in t:
-            soft += 1
-    return soft >= 4
-
+    return False
 
 def build_session() -> requests.Session:
     session = requests.Session()
@@ -587,90 +595,18 @@ def main():
 
     session = build_session()
 
+
+
+    # Warm-up: pridobi osnovne piškotke (cookie consent / session)
+
+    try:
+
+        session.get(BASE_URL, headers={'User-Agent': (_RUN_UA if '_RUN_UA' in globals() else HEADERS.get('User-Agent', 'Mozilla/5.0'))}, timeout=20)
+
+    except Exception:
+
+        pass
     # Preflight (da ne kuri časa)
     test_url = f"{list(TEHNOLES_CATEGORIES.values())[0][0]}?pagenum=1"
     test_html = get_page_content(session, test_url, referer=BASE_URL)
-    if not test_html:
-        log_and_print("Tehnoles vrača challenge/verification že na prvem testu. Končujem (debug HTML je v output mapi).")
-        write_empty_outputs(json_path, excel_path)
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-        return
-
-    # continue Zap if json exists
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if isinstance(d, list) and d:
-                _global_item_counter = max((int(x.get("Zap", 0)) for x in d if isinstance(x, dict)), default=0)
-        except Exception:
-            pass
-
-    date_str = datetime.now().strftime("%d/%m/%Y")
-    buffer: List[Dict[str, Any]] = []
-    processed = 0
-
-    try:
-        for main_cat, urls in TEHNOLES_CATEGORIES.items():
-            log_and_print(f"\n=== {main_cat} ===")
-
-            for category_url in urls:
-                # ime podkategorije iz URL
-                sub_name = category_url.split("/")[-1].split("-c-")[0].strip() or main_cat
-                log_and_print(f"\n-- Podkategorija: {sub_name}")
-
-                product_urls = get_product_links_from_category(session, category_url)
-                for purl in product_urls:
-                    log_and_print(f"    Izdelek: {purl}")
-                    det = extract_product_details(session, purl, sub_name, date_str, category_url)
-                    if det:
-                        buffer.append(det)
-                        processed += 1
-
-                    if len(buffer) >= BUFFER_FLUSH:
-                        save_data_append(buffer, json_path)
-                        buffer = []
-
-                    # jitter
-                    human_sleep(0.8, 2.2)
-
-                    # občasni počitek
-                    if processed > 0 and processed % BREAK_EVERY_PRODUCTS == 0:
-                        wait = random.uniform(BREAK_SLEEP_MIN, BREAK_SLEEP_MAX)
-                        log_and_print(f"PAUSE: {processed} izdelkov -> počitek {wait:.1f}s")
-                        time.sleep(wait)
-
-                if buffer:
-                    save_data_append(buffer, json_path)
-                    buffer = []
-
-                human_sleep(2.0, 6.0)
-
-    except Exception as e:
-        log_and_print(f"NAPAKA: {e}")
-    finally:
-        try:
-            if buffer:
-                save_data_append(buffer, json_path)
-        except Exception:
-            pass
-
-        if EXPORT_EXCEL:
-            try:
-                write_excel_from_json(json_path, excel_path)
-            except Exception as e:
-                log_and_print(f"NAPAKA pri Excel: {e}")
-
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    main()
+    
