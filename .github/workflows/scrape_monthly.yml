@@ -1,0 +1,65 @@
+name: Scrape ceniki (monthly)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub schedule je v UTC. To je 05:00 UTC na 1. dan v mesecu.
+    # Pozimi ~06:00 Ljubljana, poleti ~07:00 (DST).
+    - cron: "0 5 1 * *"
+
+concurrency:
+  group: ceniki-monthly
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shop: OBI
+            script: ObiV1_github_fixed_v4.py
+          - shop: Kalcer
+            script: KalcerV1_github_fixed_v4.py
+          - shop: Merkur
+            script: MerkurV1_github_fixed_v5.py
+          - shop: Tehnoles
+            script: TehnolesV1_github_fixed_v5.py
+          - shop: Slovenijales
+            script: SlovenijalesV1_github_fixed_v5.py
+          - shop: Zagozen
+            script: ZagozenV1_github_fixed_v5.py
+
+    env:
+      OUTPUT_DIR: artifacts
+      # Optional: lahko overridaš tempo po želji
+      # SCRAPE_SLEEP_MIN: "4.0"
+      # SCRAPE_SLEEP_MAX: "6.0"
+      # BUFFER_FLUSH: "50"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        run: |
+          python "${{ matrix.script }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ceniki-${{ matrix.shop }}"
+          path: artifacts/
+          if-no-files-found: warn
