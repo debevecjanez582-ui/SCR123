@@ -205,47 +205,54 @@ def write_empty_outputs(json_path: str, excel_path: str) -> None:
 
 
 def is_block_page(html: str) -> bool:
-    """Detekcija bot-protection/challenge strani (brez lažnih zadetkov na 'reCAPTCHA')."""
+    """Best-effort detekcija *prave* challenge/captcha strani.
+
+    Namen: zmanjšati false-positive.
+    - NE flaggamo strani samo zato, ker vsebujejo 'captcha' ali 'recaptcha' skripte.
+    - Flag je samo pri zelo značilnih podpisih (Cloudflare/PerimeterX/DataDome/Incapsula...).
+
+    Če je trgovina res prešla na obvezno JS-verifikacijo, bo ta funkcija še vedno ujela te strani.
+    """
     if not html:
         return False
+
     t = html.lower()
 
-    strong_needles = [
-        "/cdn-cgi/challenge-platform",
-        "cf-chl-",
-        "cloudflare ray id",
-        "attention required",
-        "access denied",
-        "request blocked",
-        "your request has been blocked",
-        "verifying you are human",
-        "verify you are human",
-        "please enable cookies",
-        "enable javascript and cookies",
-        "perimeterx",
-        "px-captcha",
-        "px-block",
-        "datadome",
-        "incapsula",
-        "sucuri website firewall",
-        "ddos-guard",
-        "akamai bot manager",
-    ]
-    if any(n in t for n in strong_needles):
+    # Cloudflare
+    if (
+        '/cdn-cgi/challenge-platform' in t
+        or 'cf-chl-' in t
+        or '__cf_chl' in t
+        or 'cloudflare ray id' in t
+    ):
         return True
 
-    # captcha widget indikatorji: samo, če je zraven še 'challenge' kontekst
-    if re.search(r"\b(hcaptcha|cf-turnstile|g-recaptcha|px-captcha|data-sitekey)\b", t):
-        if any(x in t for x in ("verify", "verifying", "blocked", "access denied", "challenge")):
+    # PerimeterX
+    if ('perimeterx' in t) or ('px-captcha' in t) or ('px-block' in t) or ('_pxappid' in t):
+        return True
+
+    # DataDome (običajno vsebuje besedo datadome + captcha/blocked/verify)
+    if 'datadome' in t and any(x in t for x in ('captcha', 'blocked', 'verify', 'verifying')):
+        return True
+
+    # Incapsula
+    if 'incapsula' in t and any(x in t for x in ('request unsuccessful', 'visid_incap', 'incap_ses')):
+        return True
+
+    # Akamai (tipično jasno napiše)
+    if 'akamai bot manager' in t:
+        return True
+
+    # Genericne WAF challenge strani
+    if any(x in t for x in ('verifying you are human', 'verify you are human', 'one moment, please', 'attention required')):
+        return True
+
+    # Če je captcha widget + challenge kontekst
+    if re.search(r"(hcaptcha|cf-turnstile|g-recaptcha|data-sitekey)", t):
+        if any(x in t for x in ('verify', 'verifying', 'challenge', 'access denied', 'blocked')):
             return True
 
-    # soft heuristika: več signalov skupaj
-    soft = 0
-    for n in ("captcha", "challenge", "bot", "blocked", "verify", "verification"):
-        if n in t:
-            soft += 1
-    return soft >= 4
-
+    return False
 
 def build_session() -> requests.Session:
     """Session z retry/backoff (manj napak, manj burst-a)."""
@@ -644,6 +651,17 @@ def main():
 
     session = build_session()
 
+
+
+    # Warm-up: pridobi osnovne piškotke (cookie consent / session)
+
+    try:
+
+        session.get(BASE_URL, headers={'User-Agent': (_RUN_UA if '_RUN_UA' in globals() else HEADERS.get('User-Agent', 'Mozilla/5.0'))}, timeout=20)
+
+    except Exception:
+
+        pass
     log_and_print(f"--- Zagon {SHOP_NAME} ---")
     log_and_print(f"User-Agent (stabilen za ta zagon): {_RUN_UA}")
     log_and_print(f"SLEEP=[{SLEEP_MIN},{SLEEP_MAX}] FLUSH_JSON_EVERY={FLUSH_JSON_EVERY} MAX_PAGES={MAX_PAGES}")
@@ -652,132 +670,4 @@ def main():
     first_cat = list(OBI_CATEGORIES.values())[0][0]
     test_url = f"{first_cat}?p=1"
     test_html = get_page_content(session, test_url, referer=BASE_URL)
-    if not test_html:
-        log_and_print("OBI vrača challenge/verification že na prvem testu. Končujem (debug HTML je v output mapi).")
-        write_empty_outputs(json_path, excel_path)
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-        return
-
-    all_data = load_existing_data(json_path, excel_path)
-    if all_data:
-        try:
-            _global_item_counter = max((int(x.get("Zap", 0)) for x in all_data), default=0)
-        except Exception:
-            _global_item_counter = 0
-
-    date_str = datetime.now().strftime("%d/%m/%Y")
-    buffer: List[Dict[str, Any]] = []
-
-    try:
-        for cat, urls in OBI_CATEGORIES.items():
-            log_and_print(f"\n--- {cat} ---")
-
-            for category_url in urls:
-                sub_name = category_url.strip("/").split("/")[-1]
-                log_and_print(f"  Podkategorija: {sub_name}")
-
-                n = 1
-                last_first_title = None
-
-                while n <= MAX_PAGES:
-                    page_url = f"{category_url}?p={n}"
-                    log_and_print(f"    Stran {n}: {page_url}")
-
-                    html = get_page_content(session, page_url, referer=category_url)
-                    if not html:
-                        break
-
-                    soup = BeautifulSoup(html, "lxml")
-                    container = soup.find("div", class_="list-items list-category-products")
-                    if not container:
-                        # fallback selector
-                        container = soup.find("div", class_="list-items")
-                        if not container:
-                            break
-
-                    items = container.find_all("div", class_="item")
-                    if not items:
-                        break
-
-                    first_title_el = items[0].find("h4")
-                    first_title = first_title_el.get_text(strip=True) if first_title_el else None
-                    if n > 1 and first_title and first_title == last_first_title:
-                        log_and_print("    Stran se ponavlja. Konec kategorije.")
-                        break
-                    last_first_title = first_title
-
-                    product_urls = []
-                    for it in items:
-                        a = it.find("a", href=True)
-                        if not a:
-                            continue
-                        href = a["href"]
-                        if "/p/" not in href:
-                            continue
-                        product_urls.append(normalize_url(href))
-
-                    # dedupe
-                    seen = set()
-                    product_urls = [u for u in product_urls if not (u in seen or seen.add(u))]
-
-                    for product_url in product_urls:
-                        log_and_print(f"      Izdelek: {product_url}")
-
-                        human_sleep(*DETAIL_SLEEP_RANGE)
-
-                        details = extract_product_details(
-                            session=session,
-                            product_url=product_url,
-                            category_name=cat,
-                            date_str=date_str,
-                            referer=page_url,
-                        )
-                        if details:
-                            buffer.append(details)
-
-                        if len(buffer) >= FLUSH_JSON_EVERY:
-                            all_data = merge_by_url(all_data, buffer)
-                            buffer = []
-                            write_json(all_data, json_path)
-                            log_and_print("Shranjen JSON (checkpoint).")
-
-                        human_sleep(*BETWEEN_PRODUCTS_RANGE)
-
-                    human_sleep(*BETWEEN_PAGES_RANGE)
-                    n += 1
-
-                if buffer:
-                    all_data = merge_by_url(all_data, buffer)
-                    buffer = []
-                    write_json(all_data, json_path)
-                    log_and_print("Shranjen JSON (podkategorija).")
-
-                human_sleep(*BETWEEN_SUBCATS_RANGE)
-
-    except Exception as e:
-        log_and_print(f"NAPAKA: {e}")
-    finally:
-        try:
-            if buffer:
-                all_data = merge_by_url(all_data, buffer)
-                buffer = []
-            write_json(all_data, json_path)
-            log_and_print("Shranjen JSON (final).")
-            write_excel(all_data, excel_path)
-            log_and_print("Shranjen Excel (final).")
-        except Exception as e:
-            log_and_print(f"NAPAKA pri finalnem shranjevanju: {e}")
-
-        try:
-            if _log_file:
-                _log_file.close()
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    main()
+    
