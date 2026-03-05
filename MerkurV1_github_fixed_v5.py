@@ -1,67 +1,53 @@
+import pandas as pd
 import os
-import re
-import json
+import sys
+from datetime import datetime
 import time
 import random
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
-from urllib.parse import urljoin, urlparse, urlencode, urlunparse, parse_qsl
-
-import pandas as pd
+import re
+import json
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# ============================================================
-# MERKUR scraper (GitHub/CI friendly) - refactor v5
-# ------------------------------------------------------------
-# Namen: čim bolj podobna logika kot OBI/Kalcer:
-#  - stabilen User-Agent na run (bolj "naravno")
-#  - retry/backoff (429/5xx) + captcha/verification detekcija
-#  - "polite scraping": jitter sleep + občasni počitek
-#  - JSON checkpoint v batchih, Excel 1x na koncu
-#  - cene vedno 2 decimalki (tudi če je format drugačen)
-#  - EM normalizacija: če ni v whitelist -> kos
-#  - EAN se ohrani (brez validacije dolžine)
-#  - Opis: odstrani podvajanje (npr. "X ... X ...")
-#  - Dobava: DA/NE na osnovi zaloge po centrih (če jo najdemo)
-# ============================================================
-
+# --- Konfiguracija ---
 SHOP_NAME = "Merkur"
 BASE_URL = "https://www.merkur.si"
 DDV_RATE = 0.22
 
-# Vedno Excel (1x na koncu)
-EXPORT_EXCEL = True
-
-# Tempo (prilagodljivo prek env; privzeto ~5s na request)
-SLEEP_MIN = float(os.environ.get("SCRAPE_SLEEP_MIN", "4.0"))
-SLEEP_MAX = float(os.environ.get("SCRAPE_SLEEP_MAX", "6.0"))
-
-# Start jitter (da CI ne udari vedno ob isti sekundi)
-START_JITTER_CI = (0.5, 3.0)
-START_JITTER_LOCAL = (2.0, 12.0)
-
-# checkpoint (JSON) – da ne izgubimo vsega ob prekinitvi
-FLUSH_JSON_EVERY = int(os.environ.get("FLUSH_JSON_EVERY", "50"))
-
-# varovalke
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "250"))
-MAX_BLOCK_RETRIES = int(os.environ.get("MAX_BLOCK_RETRIES", "3"))
-
-# občasni "človeški" počitek
-BREAK_EVERY_PRODUCTS = int(os.environ.get("BREAK_EVERY_PRODUCTS", "140"))
-BREAK_SLEEP_MIN = float(os.environ.get("BREAK_SLEEP_MIN", "20"))
-BREAK_SLEEP_MAX = float(os.environ.get("BREAK_SLEEP_MAX", "90"))
-
+# --- Varnostne nastavitve ---
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
 ]
-# stabilen UA na en run
-_RUN_UA = random.choice(USER_AGENTS)
+
+# Dovoljene enote mere – vse ostalo se normalizira na "kos"
+EM_WHITELIST = {"kos", "m", "m2", "m3", "kg", "l"}
+
+def normalize_unit(unit_str):
+    """Normalizira enoto mere na eno izmed dovoljenih; privzeto 'kos'."""
+    if not unit_str:
+        return "kos"
+    unit = unit_str.lower().strip()
+    # Preslikava pogostih variant
+    mapping = {
+        "kom": "kos",
+        "pal": "kos",
+        "zav": "kos",
+        "rola": "kos",
+        "kos": "kos",
+        "m": "m",
+        "m2": "m2",
+        "m²": "m2",
+        "m3": "m3",
+        "m³": "m3",
+        "kg": "kg",
+        "l": "l",
+        "liter": "l",
+    }
+    normalized = mapping.get(unit, unit)
+    return normalized if normalized in EM_WHITELIST else "kos"
 
 # Kategorije za Merkur
 MERKUR_CATEGORIES = {
@@ -72,7 +58,7 @@ MERKUR_CATEGORIES = {
         "https://www.merkur.si/gradnja/osnovni-gradbeni-izdelki-in-les/opeka-prizme/",
         "https://www.merkur.si/gradnja/osnovni-gradbeni-izdelki-in-les/malte-in-ometi/",
         "https://www.merkur.si/gradnja/osnovni-gradbeni-izdelki-in-les/zagan-les-in-letve/",
-        "https://www.merkur.si/gradnja/osnovni-gradbeni-izdelki-in-les/lepljenci/",
+        "https://www.merkur.si/gradnja/osnovni-gradbeni-izdelki-in-les/lepljenci/"
     ],
     "Termoizolacije": [
         "https://www.merkur.si/gradnja/termoizolacije/stiropor/",
@@ -80,627 +66,377 @@ MERKUR_CATEGORIES = {
         "https://www.merkur.si/gradnja/termoizolacije/steklena-volna/",
         "https://www.merkur.si/gradnja/termoizolacije/kamena-volna/",
         "https://www.merkur.si/gradnja/termoizolacije/folije/",
-        "https://www.merkur.si/gradnja/termoizolacije/ostalo/",
+        "https://www.merkur.si/gradnja/termoizolacije/ostalo/"
     ],
     "Hidroizolacije": [
         "https://www.merkur.si/gradnja/hidroizolacije/bitumenski-trakovi-in-premazi/bitumenski-premazi/",
         "https://www.merkur.si/gradnja/hidroizolacije/bitumenski-trakovi-in-premazi/bitumenski-trakovi/",
-        "https://www.merkur.si/gradnja/hidroizolacije/cementna-hidroizolacija/mrezica/",
-    ],
+        "https://www.merkur.si/gradnja/hidroizolacije/cementna-hidroizolacija/mrezica/"
+    ]
 }
 
-# EM whitelist (če ni v whitelist -> kos)
-_ALLOWED_EM = {
-    "ar", "ha",
-    "kam", "kg", "km", "kwh", "kw", "wat",
-    "kpl", "kos", "kos dan", "kos mes",
-    "m", "m2", "m3",
-    "cm", "kN", "km2", "kg/m3", "kg/h", "kg/l",
-    "m/dan", "m/h", "m/min", "m/s",
-    "m2 dan", "m2 mes",
-    "m3/dan", "m3/h", "m3/min", "m3/s", "m3 d",
-    "t", "tm", "t/dan", "t/h", "t/let",
-    "h", "min", "s",
-    "lit/dan", "lit/h", "lit/min", "lit/s",
-    "L",
-    "par", "pal", "sto", "skl", "del", "ključ",
-    "os", "os d", "x", "delež", "oc", "op",
-}
-
-BASE_EXCEL_COLS = [
-    "Skupina",
-    "Zap",
-    "Oznaka / naziv",
-    "EAN",
-    "Opis",
-    "Opis izdelka",
-    "EM",
-    "Valuta",
-    "DDV",
-    "Proizvajalec",
-    "Veljavnost od",
-    "Dobava",
-    "Cena / EM (z DDV)",
-    "Akcijska cena / EM (z DDV)",
-    "Cena / EM (brez DDV)",
-    "Akcijska cena / EM (brez DDV)",
-    "URL",
-    "SLIKA URL",
-    "Zaloga po centrih",
-]
-
-# Merkur nima fiksnega seznama "centrov" v vseh kategorijah, zato so stolpci dinamični (ostanejo v JSON).
-# Excel ima vseeno fiksne osnovne stolpce; zalogo po centrih damo v "Zaloga po centrih" (JSON string).
-
+# --- Globalne spremenljivke ---
 _log_file = None
-_debug_dir = None
 _global_item_counter = 0
 
+# --- Standardne pomožne funkcije ---
 
-# -----------------------------
-# Logging / sleeps
-# -----------------------------
-def log_and_print(message: str, to_file: bool = True) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    msg = f"[{ts}] {message}"
-    print(msg)
+def log_and_print(message, to_file=True):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_message = f"[{timestamp}] {message}"
+    print(full_message)
     if to_file and _log_file:
         try:
-            _log_file.write(msg + "\n")
+            _log_file.write(full_message + '\n')
             _log_file.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"NAPAKA: Ni mogoče zapisati v log datoteko: {e}")
 
+def create_output_and_log_paths(shop_name):
+    """Ustvari poti za output (excel+json) in log.
 
-def human_sleep(min_s: float, max_s: float) -> None:
-    time.sleep(random.uniform(min_s, max_s))
-
-
-def is_ci() -> bool:
-    return os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
-
-
-# -----------------------------
-# Output paths
-# -----------------------------
-def create_output_paths(shop_name: str):
-    """OUTPUT_DIR/Ceniki_Scraping/<SHOP>/<YYYY-MM-DD>/..."""
+    GitHub/CI:
+      - če je nastavljen env OUTPUT_DIR, se vse piše pod to mapo (npr. artifacts/)
+      - drugače se piše ob skripti
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_root = os.environ.get("OUTPUT_DIR", script_dir)
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    daily_dir = os.path.join(output_root, "Ceniki_Scraping", shop_name, today)
+    main_dir = os.path.join(output_root, "Ceniki_Scraping")
+    shop_dir = os.path.join(main_dir, shop_name)
+    today_date_folder = datetime.now().strftime("%Y-%m-%d")
+    daily_dir = os.path.join(shop_dir, today_date_folder)
+
     os.makedirs(daily_dir, exist_ok=True)
 
     filename_date = datetime.now().strftime("%d_%m_%Y")
-    json_path = os.path.join(daily_dir, f"{shop_name}_Podatki_{filename_date}.json")
-    excel_path = os.path.join(daily_dir, f"{shop_name}_Podatki_{filename_date}.xlsx")
-    log_path = os.path.join(daily_dir, f"{shop_name}_Scraping_Log_{datetime.now().strftime('%H-%M-%S')}.txt")
+    excel_filename = f"{shop_name}_Podatki_{filename_date}.xlsx"
+    json_filename = f"{shop_name}_Podatki_{filename_date}.json"
+    full_excel_path = os.path.join(daily_dir, excel_filename)
+    full_json_path = os.path.join(daily_dir, json_filename)
 
-    print(f"JSON pot: {json_path}")
-    print(f"Excel pot: {excel_path}")
-    print(f"Log pot: {log_path}")
-    return json_path, excel_path, log_path, daily_dir
+    log_filename = f"{shop_name}_Scraping_Log_{datetime.now().strftime('%H-%M-%S')}.txt"
+    log_filepath = os.path.join(daily_dir, log_filename)
 
+    print(f"Izhodna pot za Excel: {full_excel_path}")
+    print(f"Izhodna pot za JSON: {full_json_path}")
+    print(f"Izhodna pot za log: {log_filepath}")
 
-def save_debug_html(kind: str, url: str, html: str) -> None:
-    """Shrani HTML, ko naletimo na challenge (da vidiš, kaj server vrača)."""
-    global _debug_dir
-    if not _debug_dir or not html:
+    return full_excel_path, full_json_path, log_filepath
+
+def save_to_json(data, filepath):
+    """Shrani podatke v JSON (UTF-8, pretty)."""
+    if not data:
+        log_and_print("Ni novih podatkov za shranjevanje v JSON.", to_file=True)
         return
     try:
-        safe = re.sub(r"[^a-zA-Z0-9]+", "_", url)[:120]
-        path = os.path.join(_debug_dir, f"debug_{kind}_{safe}.html")
-        if os.path.exists(path):
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html)
-    except Exception:
-        pass
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        log_and_print(f"Podatki uspešno shranjeni v JSON: {filepath}", to_file=True)
+    except Exception as e:
+        log_and_print(f"Napaka pri shranjevanju v JSON: {e}", to_file=True)
 
-
-# -----------------------------
-# Block detector (FIX: no false-positive on "reCAPTCHA")
-# -----------------------------
-def is_block_page(html: str) -> bool:
-    """Best-effort detekcija *prave* challenge/captcha strani.
-
-    Namen: zmanjšati false-positive.
-    - NE flaggamo strani samo zato, ker vsebujejo 'captcha' ali 'recaptcha' skripte.
-    - Flag je samo pri zelo značilnih podpisih (Cloudflare/PerimeterX/DataDome/Incapsula...).
-
-    Če je trgovina res prešla na obvezno JS-verifikacijo, bo ta funkcija še vedno ujela te strani.
-    """
-    if not html:
-        return False
-
-    t = html.lower()
-
-    # Cloudflare
-    if (
-        '/cdn-cgi/challenge-platform' in t
-        or 'cf-chl-' in t
-        or '__cf_chl' in t
-        or 'cloudflare ray id' in t
-    ):
-        return True
-
-    # PerimeterX
-    if ('perimeterx' in t) or ('px-captcha' in t) or ('px-block' in t) or ('_pxappid' in t):
-        return True
-
-    # DataDome (običajno vsebuje besedo datadome + captcha/blocked/verify)
-    if 'datadome' in t and any(x in t for x in ('captcha', 'blocked', 'verify', 'verifying')):
-        return True
-
-    # Incapsula
-    if 'incapsula' in t and any(x in t for x in ('request unsuccessful', 'visid_incap', 'incap_ses')):
-        return True
-
-    # Akamai (tipično jasno napiše)
-    if 'akamai bot manager' in t:
-        return True
-
-    # Genericne WAF challenge strani
-    if any(x in t for x in ('verifying you are human', 'verify you are human', 'one moment, please', 'attention required')):
-        return True
-
-    # Če je captcha widget + challenge kontekst
-    if re.search(r"(hcaptcha|cf-turnstile|g-recaptcha|data-sitekey)", t):
-        if any(x in t for x in ('verify', 'verifying', 'challenge', 'access denied', 'blocked')):
-            return True
-
-    return False
-
-def build_session() -> requests.Session:
-    session = requests.Session()
-
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=1.2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-def get_headers(referer: Optional[str] = None) -> Dict[str, str]:
-    return {
-        "User-Agent": _RUN_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "sl-SI,sl;q=0.9,en-US;q=0.7,en;q=0.5",
-        "Connection": "keep-alive",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": referer or BASE_URL,
-    }
-
-
-def get_page_content(session: requests.Session, url: str, referer: Optional[str] = None) -> Optional[str]:
-    """
-    GET + backoff (429/5xx) + challenge detekcija.
-    Če dobimo "block page", počakamo in poskusimo še.
-    """
-    headers = get_headers(referer=referer)
-
-    for attempt in range(1, MAX_BLOCK_RETRIES + 1):
-        try:
-            resp = session.get(url, headers=headers, timeout=25)
-
-            if resp.status_code == 403:
-                wait = min(120, 10 * attempt + random.uniform(0, 10))
-                log_and_print(f"HTTP 403 @ {url} -> sleep {wait:.1f}s (poskus {attempt}/{MAX_BLOCK_RETRIES})")
-                time.sleep(wait)
-                continue
-
-            if resp.status_code == 429:
-                ra = resp.headers.get("Retry-After")
-                wait = int(ra) if (ra and ra.isdigit()) else random.randint(30, 120)
-                log_and_print(f"HTTP 429 @ {url} -> backoff {wait}s (poskus {attempt}/{MAX_BLOCK_RETRIES})")
-                time.sleep(wait)
-                continue
-
-            if resp.status_code in (500, 502, 503, 504):
-                wait = random.randint(10, 60)
-                log_and_print(f"HTTP {resp.status_code} @ {url} -> backoff {wait}s (poskus {attempt}/{MAX_BLOCK_RETRIES})")
-                time.sleep(wait)
-                continue
-
-            if not resp.ok:
-                log_and_print(f"HTTP {resp.status_code} @ {url}")
-                return None
-
-            html = resp.text or ""
-            if is_block_page(html):
-                wait = min(300, 30 * attempt + random.uniform(0, 30))
-                log_and_print(f"[BLOCK] challenge @ {url} -> sleep {wait:.1f}s (poskus {attempt}/{MAX_BLOCK_RETRIES})")
-                save_debug_html("block", url, html)
-                time.sleep(wait)
-                continue
-
-            return html
-
-        except requests.RequestException as e:
-            wait = min(60, 3 * attempt + random.uniform(0, 6))
-            log_and_print(f"Request error @ {url}: {e} -> sleep {wait:.1f}s (poskus {attempt}/{MAX_BLOCK_RETRIES})")
-            time.sleep(wait)
-
-    return None
-
-
-# -----------------------------
-# Price / EM helpers
-# -----------------------------
-def _parse_float_any(price_str: str) -> Optional[float]:
-    if not price_str:
-        return None
-    s = str(price_str).strip()
-    s = re.sub(r"[^\d,\.]", "", s)
-    if not s:
-        return None
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        if "," in s and "." not in s:
-            s = s.replace(",", ".")
-        if s.count(".") > 1:
-            parts = s.split(".")
-            s = "".join(parts[:-1]) + "." + parts[-1]
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def fmt_2dec(val: Optional[float]) -> str:
-    if val is None:
-        return ""
-    return f"{val:.2f}".replace(".", ",")
-
-
-def round_price_2dec(price_str: Optional[str]) -> str:
-    v = _parse_float_any(price_str) if price_str else None
-    return fmt_2dec(v)
-
-
-def convert_price_to_without_vat(price_str: Optional[str], vat_rate: float) -> str:
-    v = _parse_float_any(price_str) if price_str else None
-    if v is None:
-        return ""
-    return fmt_2dec(v / (1 + vat_rate))
-
-
-def normalize_em(unit: str) -> str:
-    if not unit:
-        return "kos"
-    u = str(unit).strip()
-    u = u.replace("m²", "m2").replace("m³", "m3").replace("²", "2").replace("³", "3")
-    u = re.sub(r"\s+", " ", u).strip()
-    u = u.replace(".", "").strip().strip("/")
-    if u == "l":
-        u = "L"
-    ul = u.lower()
-    if u in _ALLOWED_EM:
-        return u
-    if ul in _ALLOWED_EM:
-        return ul
-    if ul in ("kosov", "kos", "kom", "pcs", "pc"):
-        return "kos"
-    return "kos"
-
-
-# -----------------------------
-# Data extraction helpers
-# -----------------------------
-def clean_title_duplicate(title: str) -> str:
-    """Če je naslov podvojen (npr. 'X ... X ...'), poskusi očistit."""
-    if not title:
-        return ""
-    t = re.sub(r"\s+", " ", title).strip()
-    half = len(t) // 2
-    if half > 10 and t[:half].strip() == t[half:].strip():
-        return t[:half].strip()
-    return t
-
-
-def extract_ean_raw(soup: BeautifulSoup) -> str:
-    txt = soup.get_text(" ", strip=True)
-    m = re.search(r"(EAN|GTIN)\s*[:#]?\s*([0-9]{6,20})", txt, flags=re.IGNORECASE)
-    return m.group(2).strip() if m else ""
-
-
-def extract_image_url(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", attrs={"property": "og:image"})
-    if og and og.get("content"):
-        return og["content"].strip()
-    img = soup.select_one("img[src]")
-    return img.get("src", "").strip() if img else ""
-
-
-def extract_long_description(soup: BeautifulSoup) -> str:
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    if meta_desc and meta_desc.get("content"):
-        return meta_desc.get("content").strip()
-
-    # poskusi najti daljši opis v tipičnih blokih
-    for sel in (".product.attribute.description", "#description", ".product-info-main", ".product.info.detailed"):
-        d = soup.select_one(sel)
-        if d:
-            txt = d.get_text("\n", strip=True)
-            if txt and len(txt) > 30:
-                return (txt[:8000].rstrip() + "…") if len(txt) > 8000 else txt
-    return ""
-
-
-def extract_price_and_unit(soup: BeautifulSoup) -> Tuple[str, str]:
-    """Cena in enota (best-effort)."""
-    # različni templati; vzemi prvo najdeno ceno
-    for sel in ("span.price", ".price-wrapper .price", ".product-info-price .price"):
-        el = soup.select_one(sel)
-        if el and el.get_text(strip=True):
-            price = round_price_2dec(el.get_text(" ", strip=True))
-            if price:
-                # enota iz teksta (€/m2 ipd)
-                txt = soup.get_text(" ", strip=True)
-                munit = re.search(r"€\s*/\s*([A-Za-z0-9²³]+)", txt)
-                unit = normalize_em(munit.group(1)) if munit else "kos"
-                return price, unit
-    return "", "kos"
-
-
-def extract_stock_like_merkur(soup: BeautifulSoup) -> Dict[str, int]:
-    """
-    Merkur ima včasih zalogo po poslovalnicah/prevzemu; v HTML zna biti tekstovno.
-    Best-effort: poišče vrstice 'Merkur <lokacija> <številka> kos' ipd.
-    """
-    txt = soup.get_text("\n", strip=True).replace("\xa0", " ")
-    matches = re.findall(r"(Merkur[^\n\r]+?)\s+(\d+)\s+kos", txt, flags=re.IGNORECASE)
-    stock = {}
-    for name, qty in matches:
-        name = re.sub(r"\s+", " ", name).strip()
-        try:
-            stock[name] = int(qty)
-        except Exception:
-            pass
-    return stock
-
-
-def extract_delivery_short(soup: BeautifulSoup) -> str:
-    txt = soup.get_text(" ", strip=True).replace("\xa0", " ")
-    tl = txt.lower()
-    if "ni na zalogi" in tl:
-        return "NE"
-    if "na zalogi" in tl:
-        return "DA"
-    m = re.search(r"dobavni\s+rok\s*[:\-]?\s*([0-9]+\s*[-–]\s*[0-9]+\s*\w+)", tl)
-    return m.group(1).strip() if m else ""
-
-
-# -----------------------------
-# Save helpers
-# -----------------------------
-def _item_key(item: dict) -> str:
-    return str(item.get("URL") or "")
-
-
-def save_data_append(new_data: List[Dict[str, Any]], json_path: str) -> None:
-    if not new_data:
+def save_to_excel(data, filepath):
+    if not data:
+        log_and_print("Ni novih podatkov za shranjevanje v Excel.", to_file=True)
         return
 
-    all_data: List[Dict[str, Any]] = []
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                all_data = json.load(f)
-        except Exception:
-            all_data = []
+    df_new = pd.DataFrame(data)
 
-    data_dict = {_item_key(x): x for x in all_data if isinstance(x, dict) and x.get("URL")}
-    for x in new_data:
-        if isinstance(x, dict) and x.get("URL"):
-            data_dict[_item_key(x)] = x
-
-    final_list = list(data_dict.values())
     try:
-        final_list.sort(key=lambda x: int(x.get("Zap", 0)))
-    except Exception:
-        pass
+        if os.path.exists(filepath):
+            existing_df = pd.read_excel(filepath)
+            combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+        else:
+            combined_df = df_new
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(final_list, f, ensure_ascii=False, indent=2)
+        combined_df.drop_duplicates(subset=['URL'], keep='last', inplace=True)
 
-    log_and_print("Shranjen JSON (batch).")
+        # Dodan stolpec "Zaloga po centrih"
+        desired_columns = [
+            "Skupina", "Zap", "Oznaka / naziv", "EAN", "Opis", "EM", "Valuta", "DDV", "Proizvajalec",
+            "Veljavnost od", "Dobava", "Zaloga po centrih",
+            "Cena / EM (z DDV)", "Akcijska cena / EM (z DDV)",
+            "Cena / EM (brez DDV)", "Akcijska cena / EM (brez DDV)", "URL", "SLIKA URL"
+        ]
+        for col in desired_columns:
+            if col not in combined_df.columns:
+                combined_df[col] = ''
 
+        df_final = combined_df[desired_columns].sort_values(by="Zap").reset_index(drop=True)
+        df_final['Zap'] = df_final.index + 1
 
-def write_excel_from_json(json_path: str, excel_path: str) -> None:
-    if not os.path.exists(json_path):
-        df = pd.DataFrame([], columns=BASE_EXCEL_COLS)
-        df.to_excel(excel_path, index=False)
-        return
+        df_final.to_excel(filepath, index=False)
+        log_and_print(f"Podatki uspešno shranjeni/posodobljeni v: {filepath}", to_file=True)
+    except Exception as e:
+        error_msg = f"Napaka pri shranjevanju v Excel: {e}"
+        log_and_print(error_msg, to_file=True)
+        print(f"CRITICAL ERROR: {error_msg}")
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def get_page_content(url):
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.RequestException as e:
+        log_and_print(f"Napaka pri dostopu do URL-ja {url}: {e}", to_file=True)
+        return None
 
-    df = pd.DataFrame(data)
-    for c in BASE_EXCEL_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    df[BASE_EXCEL_COLS].to_excel(excel_path, index=False)
-    log_and_print("Shranjen Excel (na koncu).")
+def convert_price_to_without_vat(price_str, vat_rate):
+    if not price_str or not isinstance(price_str, str): return ""
+    try:
+        cleaned_price = price_str.replace('.', '').replace(',', '.')
+        price_with_vat = float(cleaned_price)
+        price_without_vat = price_with_vat / (1 + vat_rate)
+        # Vrnemo z dvema decimalkama (zamenjava pike z vejico)
+        return f"{price_without_vat:.2f}".replace('.', ',')
+    except (ValueError, TypeError):
+        return ""
 
+def clean_price_string(price_str):
+    if not price_str: return ""
+    return re.sub(r'[^\d,]', '', price_str)
 
-# -----------------------------
-# URL helpers
-# -----------------------------
-def add_or_replace_query(url: str, params: Dict[str, str]) -> str:
-    """Doda/posodobi query parametre v URL."""
-    parts = urlparse(url)
-    q = dict(parse_qsl(parts.query))
-    q.update(params)
-    new_query = urlencode(q)
-    return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
+# --- Funkcije, specifične za Merkur ---
 
-
-# -----------------------------
-# Listing -> product URLs
-# -----------------------------
-def get_product_links_from_category(session: requests.Session, category_url: str) -> List[str]:
-    links: List[str] = []
-    last_first = None
-
-    for page in range(1, MAX_PAGES + 1):
-        page_url = add_or_replace_query(category_url, {"p": str(page)}) + "#section-products"
-        log_and_print(f"  Stran {page}: {page_url}")
-
-        html = get_page_content(session, page_url, referer=category_url)
-        if not html:
-            break
-
-        soup = BeautifulSoup(html, "lxml")
-        item_container = soup.find("div", class_="list-items")
-        if not item_container:
-            break
-
-        items = item_container.find_all("div", class_="item")
-        if not items:
-            break
-
-        first_title = items[0].get_text(" ", strip=True)[:80]
-        if page > 1 and last_first and first_title == last_first:
-            log_and_print("  Stran se ponavlja. Konec kategorije.")
-            break
-        last_first = first_title
-
-        for it in items:
-            a = it.find("a", href=True)
-            if not a:
-                continue
-            href = a["href"]
-            full = href if href.startswith("http") else urljoin(BASE_URL, href)
-            # Merkur produkti so praviloma /<slug>/
-            if full.startswith(BASE_URL):
-                links.append(full)
-
-        # "a.next" včasih obstaja
-        if not soup.select_one("a.next"):
-            # če ni next, smo verjetno na zadnji strani
-            break
-
-    return list(dict.fromkeys(links))
-
-
-# -----------------------------
-# Product details
-# -----------------------------
-def extract_product_details(session: requests.Session, product_url: str, group_name: str, date_str: str, referer: str) -> Optional[Dict[str, Any]]:
+def get_product_details(product_url, group_name, query_date, item_html):
+    """Pridobi podrobnosti o izdelku."""
     global _global_item_counter
 
-    html = get_page_content(session, product_url, referer=referer)
-    if not html:
+    opis = item_html.h3.text.strip() if item_html.h3 else ""
+    cena = ""
+    cenastri_tag = item_html.span
+    if cenastri_tag:
+        cenaint = re.findall(r'[\d,]+', cenastri_tag.text.replace(".", ""))
+        if cenaint:
+            cena = cenaint[0] if len(cenaint) == 1 else cenaint[1]
+
+    if not opis and not cena:
+        log_and_print(f"      Preskakujem izdelek brez opisa in cene: {product_url}", to_file=True)
         return None
 
-    soup = BeautifulSoup(html, "lxml")
-    _global_item_counter += 1
+    log_and_print(f"    - Zajemanje podrobnosti za: {opis}", to_file=True)
 
-    data: Dict[str, Any] = {
-        "Skupina": group_name,
-        "Zap": _global_item_counter,
-        "Oznaka / naziv": "",
-        "EAN": "",
-        "Opis": "",
-        "Opis izdelka": "",
-        "EM": "kos",
-        "Valuta": "EUR",
-        "DDV": "22",
-        "Proizvajalec": "",
-        "Veljavnost od": date_str,
-        "Dobava": "",
-        "Cena / EM (z DDV)": "",
-        "Akcijska cena / EM (z DDV)": "",
-        "Cena / EM (brez DDV)": "",
-        "Akcijska cena / EM (brez DDV)": "",
-        "URL": product_url,
-        "SLIKA URL": "",
-        "Zaloga po centrih": "",
+    details_html = get_page_content(product_url)
+    if not details_html: return None
+
+    soup2 = BeautifulSoup(details_html, "html.parser")
+
+    _global_item_counter += 1
+    product_data = {
+        "Skupina": group_name, "Zap": _global_item_counter, "URL": product_url,
+        "Veljavnost od": query_date, "Valuta": "EUR", "DDV": "22", "EM": "KOS",
+        "Opis": opis, "Cena / EM (z DDV)": cena,
+        "EAN": "", "Dobava": "", "Zaloga po centrih": ""
     }
 
-    h1 = soup.select_one("h1")
-    if h1:
-        data["Opis"] = clean_title_duplicate(h1.get_text(" ", strip=True))
+    # --- Šifra izdelka (Oznaka / naziv) ---
+    sifra_tag = soup2.find("div", class_="product-id")
+    if sifra_tag:
+        sifraint = re.findall(r'\d+', sifra_tag.text)
+        product_data['Oznaka / naziv'] = sifraint[0] if sifraint else ''
 
-    data["Opis izdelka"] = extract_long_description(soup)
-    data["SLIKA URL"] = extract_image_url(soup)
-    data["EAN"] = extract_ean_raw(soup)
+    # --- Slika (iz seznama) ---
+    slikca_tag = item_html.find("img")
+    product_data['SLIKA URL'] = slikca_tag.get("src") if slikca_tag else ''
 
-    # Cena + enota
-    price, unit = extract_price_and_unit(soup)
-    if price:
-        data["Cena / EM (z DDV)"] = price
-        data["Cena / EM (brez DDV)"] = convert_price_to_without_vat(price, DDV_RATE)
-    data["EM"] = normalize_em(unit)
-
-    # Koda artikla: pogosto se pojavi v URL kot zadnja številka (npr. ...-134410/)
-    m = re.search(r"-(\d{4,})/?$", product_url.strip("/"))
-    if m:
-        data["Oznaka / naziv"] = m.group(1)
-
-    # Zaloga po centrih (best-effort)
-    stock = extract_stock_like_merkur(soup)
-    if stock:
-        data["Zaloga po centrih"] = json.dumps(stock, ensure_ascii=False)
-        data["Dobava"] = "DA" if any(qty > 0 for qty in stock.values()) else "NE"
+    # --- EAN koda ---
+    ean = ""
+    ean_elem = soup2.find("div", class_="product-ean") or soup2.find("span", class_="ean") or soup2.find("meta", {"itemprop": "gtin13"})
+    if ean_elem:
+        if ean_elem.name == "meta":
+            ean = ean_elem.get("content", "")
+        else:
+            ean = ean_elem.get_text(strip=True)
     else:
-        data["Dobava"] = extract_delivery_short(soup)
+        # Poskusi v tabeli atributov
+        attr_table = soup2.find("table", class_="data-table") or soup2.find("table", class_="product-attributes")
+        if attr_table:
+            rows = attr_table.find_all("tr")
+            for row in rows:
+                th = row.find("th")
+                td = row.find("td")
+                if th and td and "ean" in th.get_text(strip=True).lower():
+                    ean = td.get_text(strip=True)
+                    break
+    product_data['EAN'] = ean
 
-    # Proizvajalec best-effort
-    txt = soup.get_text("\n", strip=True).replace("\xa0", " ")
-    mman = re.search(r"Proizvajalec\s*:\s*([^\n\r]+)", txt, flags=re.IGNORECASE)
-    if mman:
-        data["Proizvajalec"] = mman.group(1).strip()[:250]
+    # --- Daljši opis ---
+    desc = ""
+    desc_elem = soup2.find("div", class_="product-description") or soup2.find("div", class_="description") or soup2.find("div", itemprop="description")
+    if desc_elem:
+        desc = desc_elem.get_text(" ", strip=True)
+    else:
+        meta_desc = soup2.find("meta", {"name": "description"})
+        if meta_desc:
+            desc = meta_desc.get("content", "")
+    if not desc:
+        h1 = soup2.find("h1")
+        if h1:
+            desc = h1.get_text(strip=True)
+    product_data['Opis'] = desc  # nadomestimo kratek opis z daljšim
 
-    data["EM"] = normalize_em(data.get("EM") or "kos")
-    return data
+    # --- Enota mere (EM) ---
+    unit = "kos"
+    # Poskusi iz cenovnega boxa (npr. "/ kos")
+    price_box = soup2.find("div", class_="price-box")
+    if price_box:
+        price_text = price_box.get_text()
+        match = re.search(r'/\s*([a-zA-Z0-9²³]+)', price_text)
+        if match:
+            unit = match.group(1)
+        else:
+            # Poskusi v atributih
+            attr_table = soup2.find("table", class_="data-table") or soup2.find("table", class_="product-attributes")
+            if attr_table:
+                rows = attr_table.find_all("tr")
+                for row in rows:
+                    th = row.find("th")
+                    td = row.find("td")
+                    if th and td and ("enota" in th.get_text(strip=True).lower() or "mera" in th.get_text(strip=True).lower()):
+                        unit = td.get_text(strip=True)
+                        break
+    unit = normalize_unit(unit)
+    product_data['EM'] = unit
 
+    # --- Dobava po centrih ---
+    dobava = ""
+    zaloga_po_centrih = {}
+    stock_table = soup2.find("div", class_="store-stock") or soup2.find("table", class_="store-stock-table")
+    if stock_table:
+        rows = stock_table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                store = cells[0].get_text(strip=True)
+                status = cells[1].get_text(strip=True).lower()
+                in_stock = "na zalogi" in status or "dobavljivo" in status
+                zaloga_po_centrih[store] = in_stock
+        if zaloga_po_centrih:
+            dobava = "DA" if any(zaloga_po_centrih.values()) else "NE"
+    else:
+        # Če ni tabele, poskusi preprosto oznako zaloge
+        avail = soup2.find("span", class_="availability") or soup2.find("div", class_="stock-status")
+        if avail:
+            status = avail.get_text(strip=True).lower()
+            if "na zalogi" in status or "dobavljivo" in status:
+                dobava = "DA"
+            else:
+                dobava = "NE"
+    product_data['Dobava'] = dobava
+    product_data['Zaloga po centrih'] = json.dumps(zaloga_po_centrih, ensure_ascii=False) if zaloga_po_centrih else ""
 
-# -----------------------------
-# Main
-# -----------------------------
+    # --- Cena brez DDV (že obstaja, a zagotovimo dvomestni format) ---
+    product_data['Cena / EM (brez DDV)'] = convert_price_to_without_vat(cena, DDV_RATE)
+
+    return product_data
+
+# --- Glavna funkcija ---
+
 def main():
-    global _log_file, _global_item_counter, _debug_dir
-
-    if is_ci():
-        human_sleep(*START_JITTER_CI)
-    else:
-        human_sleep(*START_JITTER_LOCAL)
-
-    json_path, excel_path, log_path, daily_dir = create_output_paths(SHOP_NAME)
-    _debug_dir = daily_dir
-
+    global _log_file, _global_item_counter
+    output_filepath, json_filepath, log_filepath = create_output_and_log_paths(SHOP_NAME)
     try:
-        _log_file = open(log_path, "w", encoding="utf-8")
-    except Exception:
+        _log_file = open(log_filepath, 'w', encoding='utf-8')
+    except Exception as e:
+        print(f"CRITICAL ERROR: Ni mogoče ustvariti log datoteke: {e}")
         return
 
-    session = build_session()
+    log_and_print(f"--- Zagon zajemanja podatkov iz {SHOP_NAME} ---", to_file=True)
+    all_products_data = []
+    
+    # Naložimo obstoječe podatke za nadaljevanje števca
+    if os.path.exists(output_filepath):
+        try:
+            existing_df = pd.read_excel(output_filepath)
+            all_products_data = existing_df.to_dict(orient='records')
+            if not existing_df.empty and 'Zap' in existing_df.columns:
+                numeric_zaps = pd.to_numeric(existing_df['Zap'], errors='coerce').dropna()
+                if not numeric_zaps.empty:
+                    _global_item_counter = int(numeric_zaps.max())
+            log_and_print(f"Naloženi obstoječi podatki. Števec 'Zap' nastavljen na {_global_item_counter}.",
+                          to_file=True)
+        except Exception as e:
+            log_and_print(f"Napaka pri nalaganju obstoječih podatkov: {e}. Začenjam na novo.", to_file=True)
 
-
-
-    # Warm-up: pridobi osnovne piškotke (cookie consent / session)
+    query_date = datetime.now().strftime("%d/%m/%Y")
 
     try:
+        for main_category_name, subcategory_urls in MERKUR_CATEGORIES.items():
+            log_and_print(f"\n--- Obdelujem glavno kategorijo: {main_category_name} ---", to_file=True)
+            for sub_cat_url in subcategory_urls:
+                sub_cat_name = sub_cat_url.strip('/').split('/')[-1]
+                group_name_for_excel = sub_cat_name.replace('-', ' ').capitalize()
 
-        session.get(BASE_URL, headers={'User-Agent': (_RUN_UA if '_RUN_UA' in globals() else HEADERS.get('User-Agent', 'Mozilla/5.0'))}, timeout=20)
+                log_and_print(f"\n  -- Začenjam obdelavo podkategorije: {group_name_for_excel} --", to_file=True)
 
-    except Exception:
+                stariprvi = "star"
+                n = 1
+                new_data_for_category = []
+                existing_urls = {d.get('URL') for d in all_products_data if d.get('URL')}
 
-        pass
-    # Preflight: test en seznam (če je challenge, ne kurimo časa po vseh kategorijah)
-    test_url = list(MERKUR_CATEGORIES.values())[0][0] + "?p=1#section-products"
-    test_html = get_page_content(session, test_url, referer=BASE_URL)
-    
+                while True:
+                    paginated_url = f"{sub_cat_url}?p={n}#section-products"
+                    log_and_print(f"    Obdelujem stran {n}: {paginated_url}", to_file=True)
+
+                    html_content = get_page_content(paginated_url)
+                    if not html_content: break
+
+                    soup1 = BeautifulSoup(html_content, 'lxml')
+                    item_container = soup1.find("div", class_="list-items")
+                    if not item_container: break
+
+                    izdelek_list = item_container.find_all("div", class_="item")
+                    if not izdelek_list: break
+
+                    noviprvi = izdelek_list[0].h3.text.strip() if izdelek_list[0].h3 else None
+                    if n > 1 and noviprvi == stariprvi:
+                        log_and_print(f"      Vsebina strani {n} se ponavlja. Zaključujem.", to_file=True)
+                        break
+                    stariprvi = noviprvi
+
+                    for i in izdelek_list:
+                        link_tag = i.find("a")
+                        if not (link_tag and link_tag.get("href")): continue
+
+                        product_url = link_tag.get("href")
+                        if product_url in existing_urls: continue
+
+                        details = get_product_details(product_url, group_name_for_excel, query_date, i)
+
+                        if details:
+                            new_data_for_category.append(details)
+                            existing_urls.add(product_url)
+                            
+                            if len(new_data_for_category) % 5 == 0:
+                                save_to_excel(all_products_data + new_data_for_category, output_filepath)
+
+                        is_ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+                        time.sleep(random.uniform(0.7, 2.5) if is_ci else random.uniform(2.0, 20.0))
+
+                    if not soup1.select_one('a.next'): break
+                    n += 1
+
+                if new_data_for_category:
+                    all_products_data.extend(new_data_for_category)
+                    save_to_json(all_products_data, json_filepath)
+        save_to_excel(all_products_data, output_filepath)
+
+    except KeyboardInterrupt:
+        log_and_print("\nSkripta prekinjena. Shranjujem zajete podatke...", to_file=True)
+    except Exception as e:
+        log_and_print(f"\nNEPRIČAKOVANA NAPAKA: {e}", to_file=True)
+        import traceback
+        traceback.print_exc(file=_log_file)
+        print(f"Nepričakovana napaka: {e}. Podrobnosti so v logu.")
+    finally:
+        save_to_json(all_products_data, json_filepath)
+        save_to_excel(all_products_data, output_filepath)
+        log_and_print("\n--- Zajemanje zaključeno ---", to_file=True)
+        print(f"Zaključeno. Podatki so v: {output_filepath} in {json_filepath}")
+        if _log_file:
+            _log_file.close()
+
+if __name__ == "__main__":
+    main()
